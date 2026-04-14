@@ -548,7 +548,7 @@ def get_user_session(user_id: str) -> Dict:
     if user_id not in user_sessions:
         user_sessions[user_id] = {
             "history": [],
-            "thinking_enabled": True,
+            "thinking_enabled": False,
             "web_search": True,
             "last_seen": now,
             "cancel_event": asyncio.Event(),
@@ -790,7 +790,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     session = get_user_session(user_id)
     web_status = "ON \u2705" if session.get("web_search", True) else "OFF \U0001f515"
-    think_status = "ON \u2705" if session.get("thinking_enabled", True) else "OFF \U0001f515"
+    think_status = "ON \u2705" if session.get("thinking_enabled", False) else "OFF \U0001f515"
     history_len = len([m for m in session.get("history", []) if m.get("role") != "system"])
     await update.message.reply_text(
         "\U0001f916 *NVIDIA + Exa Assistant*\n\n"
@@ -845,7 +845,7 @@ async def thinking_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     session = get_user_session(user_id)
     if not context.args:
-        state = "enabled" if session.get("thinking_enabled", True) else "disabled"
+        state = "enabled" if session.get("thinking_enabled", False) else "disabled"
         await update.message.reply_text(
             f"💭 *Thinking Mode:* {state}\n\nUse `/thinking on` or `/thinking off`.",
             parse_mode="Markdown",
@@ -922,7 +922,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     session = get_user_session(user_id)
     web = "ON \u2705" if session.get("web_search", True) else "OFF \U0001f515"
-    thinking = "ON \u2705" if session.get("thinking_enabled", True) else "OFF \U0001f515"
+    thinking = "ON \u2705" if session.get("thinking_enabled", False) else "OFF \U0001f515"
     history_len = len([m for m in session.get("history", []) if m.get("role") != "system"])
     await update.message.reply_text(
         "\U0001f4ca *Current Settings*\n\n"
@@ -964,7 +964,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Keep the "typing…" indicator alive for the full duration of the request.
         typing_task = asyncio.create_task(_keep_typing(update.message.chat))
 
-        thinking_enabled = session.get("thinking_enabled", True)
+        thinking_enabled = session.get("thinking_enabled", False)
         web_on = session.get("web_search", True)
 
         session["history"].append({"role": "user", "content": user_message})
