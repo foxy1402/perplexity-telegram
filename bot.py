@@ -413,7 +413,14 @@ class NvidiaLangChainProvider(AIProvider):
             return "💭 *Thinking:*\n" + "".join(reasoning_parts) + "\n\n" + "".join(content_parts)
 
         # Strip any <think>...</think> blocks the model may emit.
-        return _strip_think_tags("".join(content_parts))
+        cleaned = _strip_think_tags("".join(content_parts))
+        if not cleaned:
+            # Model put everything inside <think> (common on planner calls with short output).
+            # Extract the content from within the think block as a fallback.
+            m_think = re.search(r"<think>([\s\S]*?)</think>", "".join(content_parts), re.IGNORECASE)
+            if m_think:
+                cleaned = m_think.group(1).strip()
+        return cleaned
 
 
 class ExaSearchService:
@@ -743,10 +750,16 @@ async def _research_answer_loop(
             traces.append({"query": payload, "snippets": snippets or ["No useful results returned."]})
             continue
 
-        # Malformed planner output: continue by doing one generic fallback search.
-        fallback_q = user_message[:80].strip()
-        snippets = await web_search(fallback_q)
-        traces.append({"query": fallback_q, "snippets": snippets or ["No useful results returned."]})
+        # Malformed planner output.
+        if not traces:
+            # No evidence yet — do one fallback search so synthesis has something to work with.
+            fallback_q = _parse_search_query(user_message) or user_message[:80].strip()
+            logger.warning("[Research] step=%s unknown action, fallback search: '%s'", step, fallback_q)
+            snippets = await web_search(fallback_q)
+            traces.append({"query": fallback_q, "snippets": snippets or ["No useful results returned."]})
+        else:
+            # Already have evidence — skip this malformed step rather than repeating a bad query.
+            logger.warning("[Research] step=%s unknown action, skipping (have %s trace(s))", step, len(traces))
 
     # Max loop steps reached: synthesize final answer from accumulated evidence.
     if traces:
