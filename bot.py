@@ -182,6 +182,18 @@ _PROMPT_RESEARCH_LOOP = (
     "OUTPUT FORMAT (MANDATORY - respond with ONLY one line):\n"
     "- If more evidence needed: SEARCH: <query>\n"
     "- If ready to answer: FINAL: <answer>\n\n"
+    "WHEN TO USE FINAL (no search needed):\n"
+    "- Questions about YOUR OWN capabilities (can you code, what can you do, etc.)\n"
+    "- Well-established facts (capitals, basic math, common knowledge)\n"
+    "- General how-to questions not requiring latest tools/methods\n"
+    "- Explanations of concepts, definitions, theories\n"
+    "- Programming/coding help with established languages\n\n"
+    "WHEN TO USE SEARCH (web data needed):\n"
+    "- Current events, news, recent developments\n"
+    "- Time-sensitive data (prices, weather, sports scores, stock values)\n"
+    "- Latest versions, updates, releases ({year} specific)\n"
+    "- Specific facts you're uncertain about\n"
+    "- Information that may have changed recently\n\n"
     "CRITICAL RULES:\n"
     "- Your ENTIRE response must be a single line starting with SEARCH: or FINAL:\n"
     "- Do NOT add explanations, reasoning, or additional text\n"
@@ -190,8 +202,10 @@ _PROMPT_RESEARCH_LOOP = (
     "- Keep queries short and specific (4-10 words)\n"
     "- If you have previous conversation context, use it to resolve pronouns (it, they, this, etc.)\n\n"
     "Examples:\n"
+    "FINAL: Yes, I can help with coding in Python, JavaScript, and many other languages.\n"
+    "FINAL: To sort a list in Python, use: my_list.sort() or sorted(my_list)\n"
     "SEARCH: latest iPhone 15 price {year}\n"
-    "FINAL: The capital of France is Paris, with a population of approximately 2.1 million.\n"
+    "SEARCH: who won Super Bowl {year}\n"
 )
 
 SYSTEM_PROMPT = _PROMPT_BASE
@@ -243,9 +257,36 @@ _GREETINGS = frozenset(
 
 
 def _skip_search_decision(text: str) -> bool:
+    """Determine if a message should skip the research loop entirely.
+
+    Only skips for truly trivial cases - everything else goes to the planner LLM
+    which intelligently decides whether to search the web (SEARCH:) or answer
+    directly from knowledge (FINAL:).
+
+    Returns True only for:
+    - Very short messages (< 6 chars)
+    - Common greetings/acknowledgments
+
+    Philosophy: Let the LLM planner make intelligent decisions rather than
+    maintaining brittle keyword patterns. The planner can distinguish between
+    "can you code" (no search needed) vs "what's the latest Python version" (search).
+    """
     if len(text) < 6:
         return True
-    return text.lower().rstrip("!?.,: ") in _GREETINGS
+
+    normalized = text.lower().rstrip("!?.,: ")
+
+    # Check exact greetings
+    if normalized in _GREETINGS:
+        return True
+
+    # Check if it starts with a greeting word (handles "hello there", "hi everyone", etc.)
+    first_word = normalized.split()[0] if normalized else ""
+    if first_word in _GREETINGS:
+        return True
+
+    # Everything else goes to the planner - let the LLM decide intelligently
+    return False
 
 
 def _parse_search_query(response: str) -> Optional[str]:
