@@ -259,17 +259,26 @@ _GREETINGS = frozenset(
 def _skip_search_decision(text: str) -> bool:
     """Determine if a message should skip the research loop entirely.
 
+    PHILOSOPHY: Trust the intelligent LLM planner for everything except greetings.
+
     Only skips for truly trivial cases - everything else goes to the planner LLM
     which intelligently decides whether to search the web (SEARCH:) or answer
     directly from knowledge (FINAL:).
 
     Returns True only for:
-    - Very short messages (< 6 chars)
-    - Common greetings/acknowledgments
+    - Very short messages (< 6 chars) - "hi", "ok", "yes"
+    - Common greetings/acknowledgments - "hello there", "thanks a lot"
 
-    Philosophy: Let the LLM planner make intelligent decisions rather than
-    maintaining brittle keyword patterns. The planner can distinguish between
-    "can you code" (no search needed) vs "what's the latest Python version" (search).
+    WHY NOT USE KEYWORD PATTERNS?
+    - ❌ "can you code" pattern → maintenance nightmare
+    - ❌ "what can you do" pattern → brittle, misses edge cases
+    - ✅ Let planner decide → handles nuance, future-proof, zero maintenance
+
+    The planner can distinguish:
+    - "can you code" → FINAL (self-knowledge)
+    - "what's the latest Python" → SEARCH (time-sensitive)
+    - "how to sort array" → FINAL (general knowledge)
+    - "best Python course 2026" → SEARCH (current recommendations)
     """
     if len(text) < 6:
         return True
@@ -784,6 +793,30 @@ async def _research_answer_loop(
     thinking_enabled: bool,
     cancel_event: Optional["asyncio.Event"] = None,
 ) -> str:
+    """Iterative research loop with intelligent planner-driven decisions.
+
+    FLOW:
+    ┌─────────────────────────────────────────────────────────────────┐
+    │ For each step (1 to RESEARCH_MAX_STEPS):                       │
+    │   1. Planner decides: SEARCH or FINAL                          │
+    │   2. If SEARCH: fetch results, add to traces, continue loop    │
+    │   3. If FINAL without traces: return answer immediately        │
+    │   4. If FINAL with traces: synthesize answer with evidence     │
+    │   5. If malformed: fallback search or synthesize if has traces │
+    └─────────────────────────────────────────────────────────────────┘
+
+    KEY DESIGN DECISIONS:
+    - Trust the planner: If it says FINAL on step 1, return immediately
+    - No forced searches: Removed "evidence-grounded enforcement" that
+      contradicted the LLM's intelligent decision
+    - Graceful degradation: Malformed responses trigger fallback searches
+
+    EXAMPLES:
+    - "can you code" → FINAL on step 1 → instant answer (no search)
+    - "latest iPhone price" → SEARCH → FINAL → synthesized answer
+    - "compare phones" → SEARCH → SEARCH → FINAL → comprehensive answer
+    """
+
     async def _synthesize_from_traces(
         final_draft: Optional[str] = None,
     ) -> str:
@@ -855,19 +888,18 @@ async def _research_answer_loop(
         logger.info("[Research] step=%s action=%s payload=%s", step, action, payload)
 
         if action == "final" and payload:
-            # Enforce evidence-grounded output: require at least one search first.
+            # CRITICAL: Trust the planner's intelligent decision
+            # The planner knows when search is needed vs when to answer directly.
+            # Examples:
+            #   - "can you code" → FINAL immediately (knows own capabilities)
+            #   - "capital of France" → FINAL (well-established fact)
+            #   - After searches → FINAL (has enough evidence)
             if not traces:
-                fallback_q = (
-                    _parse_search_query(user_message) or user_message[:80].strip()
-                )
-                snippets = await web_search(fallback_q)
-                traces.append(
-                    {
-                        "query": fallback_q,
-                        "snippets": snippets or ["No useful results returned."],
-                    }
-                )
-                continue
+                # No searches performed - planner determined answer from knowledge
+                # This is the FAST PATH for questions that don't need web data
+                return payload
+            # Planner has search results - synthesize final answer with evidence
+            # This ensures web results are properly integrated into the response
             return await _synthesize_from_traces(final_draft=payload)
 
         if action == "search" and payload:
@@ -880,17 +912,23 @@ async def _research_answer_loop(
             )
             continue
 
-        # Malformed planner output - try to extract something useful
+        # EDGE CASE: Malformed planner output (model didn't follow SEARCH:/FINAL: format)
+        # This can happen due to:
+        #   - Token limits causing truncation (we handle FIN: abbreviation)
+        #   - Model confusion on complex queries
+        #   - Reasoning leakage when thinking is disabled
         logger.warning(
             "[Research] step=%s malformed planner response: '%s'", step, decision[:100]
         )
 
         if not traces:
-            # No evidence yet — extract a search query from the user message or planner response
+            # RECOVERY PATH 1: No evidence yet - do a fallback search
+            # Try to extract a query from the malformed response, or use user's question
+            # This ensures we make progress even if planner malfunctions
             fallback_q = (
-                _parse_search_query(decision)
-                or _parse_search_query(user_message)
-                or user_message[:80].strip()
+                _parse_search_query(decision)  # Try to extract from malformed output
+                or _parse_search_query(user_message)  # Fallback to user question
+                or user_message[:80].strip()  # Last resort: truncated user message
             )
             logger.info("[Research] step=%s fallback search: '%s'", step, fallback_q)
             snippets = await web_search(fallback_q)
@@ -901,7 +939,9 @@ async def _research_answer_loop(
                 }
             )
         else:
-            # Already have evidence — treat as implicit FINAL and synthesize
+            # RECOVERY PATH 2: Already have evidence - synthesize what we have
+            # Treat malformed response as an implicit FINAL decision
+            # This prevents wasting steps when we already have usable data
             logger.info(
                 "[Research] step=%s treating malformed as FINAL (have %s traces)",
                 step,
@@ -909,11 +949,19 @@ async def _research_answer_loop(
             )
             return await _synthesize_from_traces(final_draft=None)
 
-    # Max loop steps reached: synthesize final answer from accumulated evidence.
+    # POST-LOOP: Max steps reached without explicit FINAL decision
+    # This happens when planner keeps saying SEARCH for all 4 steps
     if traces:
+        # We accumulated evidence - synthesize comprehensive answer from all searches
+        # Example: Complex query that needed multiple rounds of research
         return await _synthesize_from_traces()
 
-    # If no traces were generated, fallback to direct answer.
+    # SAFETY NET: No traces generated (should be nearly impossible)
+    # This can only happen if:
+    #   1. All steps returned FINAL without payload (empty responses)
+    #   2. All searches somehow failed to append to traces (bug in error handling)
+    # In practice, malformed handler (line 881-887) ensures at least 1 trace exists
+    # This is here as defensive programming for unforeseen edge cases
     return await _chat_with_retry(
         provider_obj=provider_obj,
         messages=session_history,
