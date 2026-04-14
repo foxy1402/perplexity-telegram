@@ -356,7 +356,8 @@ class AIProvider(ABC):
     def chat(
         self,
         messages: List[Dict],
-        enable_thinking: bool = False,
+        enable_thinking: bool = True,
+        show_thinking: bool = False,
         max_tokens: Optional[int] = None,
     ) -> str:
         pass
@@ -382,7 +383,8 @@ class NvidiaLangChainProvider(AIProvider):
     def chat(
         self,
         messages: List[Dict],
-        enable_thinking: bool = False,
+        enable_thinking: bool = True,
+        show_thinking: bool = False,
         max_tokens: Optional[int] = None,
     ) -> str:
         max_out = max_tokens or MAX_TOKENS
@@ -407,10 +409,10 @@ class NvidiaLangChainProvider(AIProvider):
         if not content_parts and not reasoning_parts:
             raise ValueError("API returned empty response.")
 
-        if enable_thinking and reasoning_parts:
+        if show_thinking and reasoning_parts:
             return "💭 *Thinking:*\n" + "".join(reasoning_parts) + "\n\n" + "".join(content_parts)
 
-        # Strip any <think>...</think> blocks the model may emit even when thinking is off.
+        # Strip any <think>...</think> blocks the model may emit.
         return _strip_think_tags("".join(content_parts))
 
 
@@ -589,7 +591,8 @@ async def reply_text_safe(message, text: str):
 async def _chat_with_retry(
     provider_obj,
     messages: list,
-    enable_thinking: bool,
+    enable_thinking: bool = True,
+    show_thinking: bool = False,
     max_tokens: Optional[int] = None,
     cancel_event: Optional["asyncio.Event"] = None,
 ) -> str:
@@ -603,6 +606,7 @@ async def _chat_with_retry(
                         provider_obj.chat,
                         messages=messages,
                         enable_thinking=enable_thinking,
+                        show_thinking=show_thinking,
                         max_tokens=max_tokens or MAX_TOKENS,
                     ),
                     timeout=_CHAT_ATTEMPT_TIMEOUT,
@@ -686,7 +690,8 @@ async def _research_answer_loop(
         return await _chat_with_retry(
             provider_obj=provider_obj,
             messages=synth_msgs,
-            enable_thinking=thinking_enabled,
+            enable_thinking=True,
+            show_thinking=thinking_enabled,
             cancel_event=cancel_event,
         )
 
@@ -751,7 +756,8 @@ async def _research_answer_loop(
     return await _chat_with_retry(
         provider_obj=provider_obj,
         messages=session_history,
-        enable_thinking=thinking_enabled,
+        enable_thinking=True,
+        show_thinking=thinking_enabled,
         cancel_event=cancel_event,
     )
 
@@ -976,7 +982,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bot_response = await _chat_with_retry(
                 provider_obj=provider,
                 messages=session["history"],
-                enable_thinking=thinking_enabled,
+                enable_thinking=True,
+                show_thinking=thinking_enabled,
                 cancel_event=cancel_event,
             )
         else:
