@@ -5,8 +5,17 @@ import os
 import re
 import threading
 import time
+import warnings
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Tuple
+
+# Suppress LangChain advisory about <think> tag handling — our code already reads
+# reasoning content from additional_kwargs['reasoning_content'] directly.
+warnings.filterwarnings(
+    "ignore",
+    message="Reasoning content was parsed from <think> tags",
+    category=UserWarning,
+)
 
 from langchain_exa import ExaSearchRetriever
 from langchain_nvidia_ai_endpoints import ChatNVIDIA
