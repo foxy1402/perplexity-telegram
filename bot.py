@@ -37,7 +37,9 @@ logger = logging.getLogger(__name__)
 # Core environment variables
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
-EXA_API_KEYS = [k.strip() for k in os.getenv("EXA_API_KEYS", "").split(",") if k.strip()]
+EXA_API_KEYS = [
+    k.strip() for k in os.getenv("EXA_API_KEYS", "").split(",") if k.strip()
+]
 
 
 def _parse_uid_allowlist() -> List[str]:
@@ -177,16 +179,19 @@ _PROMPT_RESEARCH_LOOP = (
     "You are an accuracy-first research planner. Today's date is {date} (current year: {year}).\n\n"
     "Task: decide whether to search the web again or return a final answer.\n"
     "You may perform MULTIPLE search rounds before answering.\n\n"
-    "Output format (strict):\n"
-    "- If more evidence is needed: SEARCH: <query>\n"
-    "- If confident enough to answer: FINAL: <answer>\n\n"
-    "Rules:\n"
-    "- Use SEARCH when information may be time-sensitive or uncertain.\n"
-    "- For time-sensitive queries always use the current year ({year}). NEVER use past years like 2024 or 2025.\n"
-    "- Refine search queries using what is already known.\n"
-    "- Keep query short and specific (4-10 words).\n"
-    "- If evidence is sufficient, return FINAL with concise, practical answer.\n"
-    "- Do not output anything except SEARCH:... or FINAL:..."
+    "OUTPUT FORMAT (MANDATORY - respond with ONLY one line):\n"
+    "- If more evidence needed: SEARCH: <query>\n"
+    "- If ready to answer: FINAL: <answer>\n\n"
+    "CRITICAL RULES:\n"
+    "- Your ENTIRE response must be a single line starting with SEARCH: or FINAL:\n"
+    "- Do NOT add explanations, reasoning, or additional text\n"
+    "- For time-sensitive queries, always use current year ({year}), never past years\n"
+    "- Refine search queries using what is already known\n"
+    "- Keep queries short and specific (4-10 words)\n"
+    "- If you have previous conversation context, use it to resolve pronouns (it, they, this, etc.)\n\n"
+    "Examples:\n"
+    "SEARCH: latest iPhone 15 price {year}\n"
+    "FINAL: The capital of France is Paris, with a population of approximately 2.1 million.\n"
 )
 
 SYSTEM_PROMPT = _PROMPT_BASE
@@ -292,7 +297,9 @@ def _build_search_context(query: str, snippets: list) -> str:
     return "\n".join(parts)
 
 
-def _build_research_context(user_message: str, traces: List[Dict[str, List[str]]]) -> str:
+def _build_research_context(
+    user_message: str, traces: List[Dict[str, List[str]]]
+) -> str:
     lines = [f"User question: {user_message}"]
     if not traces:
         lines.append("No previous web searches yet.")
@@ -309,6 +316,41 @@ def _build_research_context(user_message: str, traces: List[Dict[str, List[str]]
             lines.append(f"{i}.{j} {s}")
             snippet_budget -= 1
     return "\n".join(lines)
+
+
+def _get_recent_context(session_history: list, max_pairs: int = 2) -> str:
+    """Extract recent conversational context for the planner.
+
+    Returns a summary of the last N message pairs to help with follow-up questions
+    while avoiding context overload that causes truncated planner responses.
+    """
+    # Filter out system messages and get only user/assistant pairs
+    conv_messages = [
+        m for m in session_history if m.get("role") in ("user", "assistant")
+    ]
+
+    if not conv_messages:
+        return ""
+
+    # Take last N pairs (N*2 messages)
+    max_messages = max_pairs * 2
+    recent = (
+        conv_messages[-max_messages:]
+        if len(conv_messages) > max_messages
+        else conv_messages
+    )
+
+    # Format as compact context
+    lines = []
+    for msg in recent:
+        role = msg.get("role", "").capitalize()
+        content = msg.get("content", "").strip()
+        # Truncate very long messages to prevent context bloat
+        if len(content) > 200:
+            content = content[:200] + "..."
+        lines.append(f"{role}: {content}")
+
+    return "\n".join(lines) if lines else ""
 
 
 def _parse_research_action(response: str) -> Tuple[str, Optional[str]]:
@@ -419,14 +461,21 @@ class NvidiaLangChainProvider(AIProvider):
             raise ValueError("API returned empty response.")
 
         if show_thinking and reasoning_parts:
-            return "💭 *Thinking:*\n" + "".join(reasoning_parts) + "\n\n" + "".join(content_parts)
+            return (
+                "💭 *Thinking:*\n"
+                + "".join(reasoning_parts)
+                + "\n\n"
+                + "".join(content_parts)
+            )
 
         # Strip any <think>...</think> blocks the model may emit.
         cleaned = _strip_think_tags("".join(content_parts))
         if not cleaned:
             # Model put everything inside <think> (common on planner calls with short output).
             # Extract the content from within the think block as a fallback.
-            m_think = re.search(r"<think>([\s\S]*?)</think>", "".join(content_parts), re.IGNORECASE)
+            m_think = re.search(
+                r"<think>([\s\S]*?)</think>", "".join(content_parts), re.IGNORECASE
+            )
             if m_think:
                 cleaned = m_think.group(1).strip()
         if not cleaned and reasoning_parts:
@@ -434,7 +483,6 @@ class NvidiaLangChainProvider(AIProvider):
             # calls). Use the reasoning text so SEARCH:/FINAL: can still be parsed from it.
             cleaned = "".join(reasoning_parts).strip()
         return cleaned
-
 
 
 class ExaSearchService:
@@ -558,9 +606,9 @@ def _prune_user_sessions(now: float):
 
     # Drop oldest sessions until under cap.
     excess = len(user_sessions) - MAX_USER_SESSIONS
-    oldest = sorted(
-        user_sessions.items(), key=lambda kv: kv[1].get("last_seen", now)
-    )[:excess]
+    oldest = sorted(user_sessions.items(), key=lambda kv: kv[1].get("last_seen", now))[
+        :excess
+    ]
     for uid, _ in oldest:
         user_sessions.pop(uid, None)
 
@@ -687,7 +735,9 @@ async def _research_answer_loop(
     async def _synthesize_from_traces(
         final_draft: Optional[str] = None,
     ) -> str:
-        synth_snippets = [s for t in traces for s in t["snippets"]][:RESEARCH_MAX_SNIPPETS]
+        synth_snippets = [s for t in traces for s in t["snippets"]][
+            :RESEARCH_MAX_SNIPPETS
+        ]
         synth_context = _build_search_context(
             query="iterative research",
             snippets=synth_snippets,
@@ -723,18 +773,22 @@ async def _research_answer_loop(
         if cancel_event and cancel_event.is_set():
             raise asyncio.CancelledError("Cancelled by /restart")
 
-        # The planner only needs to decide SEARCH vs FINAL based on the current question
-        # and evidence gathered so far. Feeding the full session history causes context
-        # poisoning on follow-up questions — the model gets overwhelmed and outputs only
-        # reasoning with no SEARCH:/FINAL: action, which parses as unknown.
+        # Build context: recent conversation (for pronoun resolution) + current research state
+        recent_context = _get_recent_context(session_history, max_pairs=2)
+        context_parts = []
+
+        if recent_context:
+            context_parts.append(f"Recent conversation:\n{recent_context}\n")
+
+        context_parts.append(f"Current question: {user_message}")
+        context_parts.append(f"Research step {step}/{RESEARCH_MAX_STEPS}")
+        context_parts.append(_build_research_context(user_message, traces))
+
         planner_messages = [
             {"role": "system", "content": loop_prompt},
             {
                 "role": "user",
-                "content": (
-                    f"Research step {step}/{RESEARCH_MAX_STEPS}.\n"
-                    + _build_research_context(user_message, traces)
-                ),
+                "content": "\n\n".join(context_parts),
             },
         ]
 
@@ -742,7 +796,7 @@ async def _research_answer_loop(
             provider_obj=provider_obj,
             messages=planner_messages,
             enable_thinking=False,
-            max_tokens=500,
+            max_tokens=300,  # Reduced from 500 to prevent truncation
             cancel_event=cancel_event,
         )
         action, payload = _parse_research_action(decision)
@@ -751,7 +805,9 @@ async def _research_answer_loop(
         if action == "final" and payload:
             # Enforce evidence-grounded output: require at least one search first.
             if not traces:
-                fallback_q = _parse_search_query(user_message) or user_message[:80].strip()
+                fallback_q = (
+                    _parse_search_query(user_message) or user_message[:80].strip()
+                )
                 snippets = await web_search(fallback_q)
                 traces.append(
                     {
@@ -764,19 +820,42 @@ async def _research_answer_loop(
 
         if action == "search" and payload:
             snippets = await web_search(payload)
-            traces.append({"query": payload, "snippets": snippets or ["No useful results returned."]})
+            traces.append(
+                {
+                    "query": payload,
+                    "snippets": snippets or ["No useful results returned."],
+                }
+            )
             continue
 
-        # Malformed planner output.
+        # Malformed planner output - try to extract something useful
+        logger.warning(
+            "[Research] step=%s malformed planner response: '%s'", step, decision[:100]
+        )
+
         if not traces:
-            # No evidence yet — do one fallback search so synthesis has something to work with.
-            fallback_q = _parse_search_query(user_message) or user_message[:80].strip()
-            logger.warning("[Research] step=%s unknown action, fallback search: '%s'", step, fallback_q)
+            # No evidence yet — extract a search query from the user message or planner response
+            fallback_q = (
+                _parse_search_query(decision)
+                or _parse_search_query(user_message)
+                or user_message[:80].strip()
+            )
+            logger.info("[Research] step=%s fallback search: '%s'", step, fallback_q)
             snippets = await web_search(fallback_q)
-            traces.append({"query": fallback_q, "snippets": snippets or ["No useful results returned."]})
+            traces.append(
+                {
+                    "query": fallback_q,
+                    "snippets": snippets or ["No useful results returned."],
+                }
+            )
         else:
-            # Already have evidence — skip this malformed step rather than repeating a bad query.
-            logger.warning("[Research] step=%s unknown action, skipping (have %s trace(s))", step, len(traces))
+            # Already have evidence — treat as implicit FINAL and synthesize
+            logger.info(
+                "[Research] step=%s treating malformed as FINAL (have %s traces)",
+                step,
+                len(traces),
+            )
+            return await _synthesize_from_traces(final_draft=None)
 
     # Max loop steps reached: synthesize final answer from accumulated evidence.
     if traces:
@@ -814,20 +893,26 @@ def _clean_for_history(response: str) -> str:
     if response.startswith("\U0001f4ad *Thinking:*\n"):
         sep = response.find("\n\n", len("\U0001f4ad *Thinking:*\n"))
         if sep != -1:
-            return response[sep + 2:].strip()
+            return response[sep + 2 :].strip()
     return response
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     if not is_user_allowed(user_id):
-        await update.message.reply_text("\u26d4 Sorry, you're not authorized to use this bot.")
+        await update.message.reply_text(
+            "\u26d4 Sorry, you're not authorized to use this bot."
+        )
         return
 
     session = get_user_session(user_id)
     web_status = "ON \u2705" if session.get("web_search", True) else "OFF \U0001f515"
-    think_status = "ON \u2705" if session.get("thinking_enabled", False) else "OFF \U0001f515"
-    history_len = len([m for m in session.get("history", []) if m.get("role") != "system"])
+    think_status = (
+        "ON \u2705" if session.get("thinking_enabled", False) else "OFF \U0001f515"
+    )
+    history_len = len(
+        [m for m in session.get("history", []) if m.get("role") != "system"]
+    )
     await update.message.reply_text(
         "\U0001f916 *NVIDIA + Exa Assistant*\n\n"
         f"\U0001f9e0 Model: `{MODEL_ID}`\n"
@@ -848,7 +933,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     if not is_user_allowed(user_id):
-        await update.message.reply_text("⛔ Sorry, you're not authorized to use this bot.")
+        await update.message.reply_text(
+            "⛔ Sorry, you're not authorized to use this bot."
+        )
         return
     get_user_session(user_id)["history"] = []
     await update.message.reply_text("🗑️ Conversation history cleared!")
@@ -856,7 +943,9 @@ async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_user_allowed(str(update.effective_user.id)):
-        await update.message.reply_text("⛔ Sorry, you're not authorized to use this bot.")
+        await update.message.reply_text(
+            "⛔ Sorry, you're not authorized to use this bot."
+        )
         return
     await update.message.reply_text(
         "💡 *How to use:*\n\n"
@@ -876,7 +965,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def thinking_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     if not is_user_allowed(user_id):
-        await update.message.reply_text("⛔ Sorry, you're not authorized to use this bot.")
+        await update.message.reply_text(
+            "⛔ Sorry, you're not authorized to use this bot."
+        )
         return
 
     session = get_user_session(user_id)
@@ -891,18 +982,26 @@ async def thinking_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     arg = context.args[0].lower()
     if arg == "on":
         session["thinking_enabled"] = True
-        await update.message.reply_text("✅ *Thinking mode enabled.*", parse_mode="Markdown")
+        await update.message.reply_text(
+            "✅ *Thinking mode enabled.*", parse_mode="Markdown"
+        )
     elif arg == "off":
         session["thinking_enabled"] = False
-        await update.message.reply_text("🔕 *Thinking mode disabled.*", parse_mode="Markdown")
+        await update.message.reply_text(
+            "🔕 *Thinking mode disabled.*", parse_mode="Markdown"
+        )
     else:
-        await update.message.reply_text("❌ Use `/thinking on` or `/thinking off`", parse_mode="Markdown")
+        await update.message.reply_text(
+            "❌ Use `/thinking on` or `/thinking off`", parse_mode="Markdown"
+        )
 
 
 async def web_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     if not is_user_allowed(user_id):
-        await update.message.reply_text("⛔ Sorry, you're not authorized to use this bot.")
+        await update.message.reply_text(
+            "⛔ Sorry, you're not authorized to use this bot."
+        )
         return
 
     session = get_user_session(user_id)
@@ -930,7 +1029,9 @@ async def web_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     if not is_user_allowed(user_id):
-        await update.message.reply_text("⛔ Sorry, you're not authorized to use this bot.")
+        await update.message.reply_text(
+            "⛔ Sorry, you're not authorized to use this bot."
+        )
         return
 
     session = get_user_session(user_id)
@@ -953,13 +1054,19 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     if not is_user_allowed(user_id):
-        await update.message.reply_text("\u26d4 Sorry, you're not authorized to use this bot.")
+        await update.message.reply_text(
+            "\u26d4 Sorry, you're not authorized to use this bot."
+        )
         return
 
     session = get_user_session(user_id)
     web = "ON \u2705" if session.get("web_search", True) else "OFF \U0001f515"
-    thinking = "ON \u2705" if session.get("thinking_enabled", False) else "OFF \U0001f515"
-    history_len = len([m for m in session.get("history", []) if m.get("role") != "system"])
+    thinking = (
+        "ON \u2705" if session.get("thinking_enabled", False) else "OFF \U0001f515"
+    )
+    history_len = len(
+        [m for m in session.get("history", []) if m.get("role") != "system"]
+    )
     await update.message.reply_text(
         "\U0001f4ca *Current Settings*\n\n"
         f"\U0001f9e0 *Model:* `{MODEL_ID}`\n"
@@ -974,7 +1081,9 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     if not is_user_allowed(user_id):
-        await update.message.reply_text("⛔ Sorry, you're not authorized to use this bot.")
+        await update.message.reply_text(
+            "⛔ Sorry, you're not authorized to use this bot."
+        )
         return
 
     user_message = update.message.text
@@ -1031,12 +1140,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
         if not bot_response.strip():
-            bot_response = "\u26a0\ufe0f The AI returned an empty response. Please try again."
+            bot_response = (
+                "\u26a0\ufe0f The AI returned an empty response. Please try again."
+            )
 
         # Store a clean response (no thinking-trace header) to keep context window tidy.
-        session["history"].append({"role": "assistant", "content": _clean_for_history(bot_response)})
+        session["history"].append(
+            {"role": "assistant", "content": _clean_for_history(bot_response)}
+        )
         assistant_appended = True
-        _trim_history(session["history"])
+        session["history"] = _trim_history(session["history"])
 
         if len(bot_response) <= MAX_MESSAGE_LENGTH:
             await reply_text_safe(update.message, bot_response)
@@ -1067,12 +1180,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         chunks.append(current_chunk)
                     current_chunk = line
                 else:
-                    current_chunk = ((current_chunk + "\n" + line) if current_chunk else line)
+                    current_chunk = (
+                        (current_chunk + "\n" + line) if current_chunk else line
+                    )
             if current_chunk:
                 chunks.append(current_chunk)
 
             for i, chunk in enumerate(chunks, 1):
-                header = f"\U0001f4c4 Part {i}/{len(chunks)}\n\n" if len(chunks) > 1 else ""
+                header = (
+                    f"\U0001f4c4 Part {i}/{len(chunks)}\n\n" if len(chunks) > 1 else ""
+                )
                 await reply_text_safe(update.message, header + chunk)
 
     except asyncio.CancelledError:
@@ -1128,7 +1245,9 @@ def main():
     application.add_handler(CommandHandler("web", web_command))
     application.add_handler(CommandHandler("thinking", thinking_command))
     application.add_handler(CommandHandler("restart", restart_command))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
+    )
 
     logger.info("🚀 NVIDIA + Exa Telegram bot started")
     logger.info("🧠 Model: %s", MODEL_ID)
@@ -1146,7 +1265,10 @@ def main():
         MAX_USER_SESSIONS,
     )
     if ALLOWED_USER_IDS:
-        logger.info("🔐 Access mode: allowlist enabled (%s Telegram UID(s))", len(ALLOWED_USER_IDS))
+        logger.info(
+            "🔐 Access mode: allowlist enabled (%s Telegram UID(s))",
+            len(ALLOWED_USER_IDS),
+        )
     else:
         logger.info("🔓 Access mode: open (no TELEGRAM_ALLOWED_UIDS set)")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
