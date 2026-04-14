@@ -459,7 +459,7 @@ class ExaSearchService:
             api_key = self.api_keys[key_idx]
             try:
                 retriever = ExaSearchRetriever(
-                    api_key=api_key,
+                    exa_api_key=api_key,
                     k=EXA_MAX_RESULTS,
                     highlights=True,
                 )
