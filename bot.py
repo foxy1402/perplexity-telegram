@@ -714,17 +714,20 @@ async def _research_answer_loop(
         if cancel_event and cancel_event.is_set():
             raise asyncio.CancelledError("Cancelled by /restart")
 
-        planner_messages = [{"role": "system", "content": loop_prompt}]
-        planner_messages += [m for m in session_history[-MAX_HISTORY_MESSAGES:] if m.get("role") != "system"]
-        planner_messages.append(
+        # The planner only needs to decide SEARCH vs FINAL based on the current question
+        # and evidence gathered so far. Feeding the full session history causes context
+        # poisoning on follow-up questions — the model gets overwhelmed and outputs only
+        # reasoning with no SEARCH:/FINAL: action, which parses as unknown.
+        planner_messages = [
+            {"role": "system", "content": loop_prompt},
             {
                 "role": "user",
                 "content": (
                     f"Research step {step}/{RESEARCH_MAX_STEPS}.\n"
                     + _build_research_context(user_message, traces)
                 ),
-            }
-        )
+            },
+        ]
 
         decision = await _chat_with_retry(
             provider_obj=provider_obj,
