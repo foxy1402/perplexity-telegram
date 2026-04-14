@@ -420,7 +420,12 @@ class NvidiaLangChainProvider(AIProvider):
             m_think = re.search(r"<think>([\s\S]*?)</think>", "".join(content_parts), re.IGNORECASE)
             if m_think:
                 cleaned = m_think.group(1).strip()
+        if not cleaned and reasoning_parts:
+            # Model generated only reasoning with no answer content (happens on follow-up planner
+            # calls). Use the reasoning text so SEARCH:/FINAL: can still be parsed from it.
+            cleaned = "".join(reasoning_parts).strip()
         return cleaned
+
 
 
 class ExaSearchService:
