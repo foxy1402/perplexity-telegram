@@ -99,7 +99,8 @@ python bot.py
 
 ## Commands
 
-- `/start` - Show bot status and quick help
+- `/start` - Show bot info and current settings
+- `/status` - Show current model, thinking mode, web search state, history length, and Exa key count
 - `/help` - Show usage help
 - `/web` - Show web-search state
 - `/web on` - Enable Exa search

@@ -165,7 +165,7 @@ _PROMPT_SEARCH_RESULTS = (
 )
 
 _PROMPT_RESEARCH_LOOP = (
-    "You are an accuracy-first research planner. Today's date is {date}.\n\n"
+    "You are an accuracy-first research planner. Today's date is {date} (current year: {year}).\n\n"
     "Task: decide whether to search the web again or return a final answer.\n"
     "You may perform MULTIPLE search rounds before answering.\n\n"
     "Output format (strict):\n"
@@ -173,6 +173,7 @@ _PROMPT_RESEARCH_LOOP = (
     "- If confident enough to answer: FINAL: <answer>\n\n"
     "Rules:\n"
     "- Use SEARCH when information may be time-sensitive or uncertain.\n"
+    "- For time-sensitive queries always use the current year ({year}). NEVER use past years like 2024 or 2025.\n"
     "- Refine search queries using what is already known.\n"
     "- Keep query short and specific (4-10 words).\n"
     "- If evidence is sufficient, return FINAL with concise, practical answer.\n"
@@ -184,8 +185,15 @@ SYSTEM_PROMPT_WITH_RESULTS = _PROMPT_BASE + _PROMPT_SEARCH_RESULTS
 
 
 def _make_research_loop_prompt() -> str:
-    today = datetime.datetime.now().strftime("%Y-%m-%d")
-    return _PROMPT_RESEARCH_LOOP.format(date=today)
+    now = datetime.datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    year = now.strftime("%Y")
+    return _PROMPT_RESEARCH_LOOP.format(date=today, year=year)
+
+
+def _strip_think_tags(text: str) -> str:
+    """Remove <think>...</think> blocks emitted by the model when thinking is disabled."""
+    return re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.IGNORECASE).strip()
 
 
 _GREETINGS = frozenset(
@@ -364,9 +372,11 @@ class NvidiaLangChainProvider(AIProvider):
             api_key=self.api_key,
             temperature=TEMPERATURE,
             top_p=TOP_P,
-            max_tokens=max_tokens,
-            reasoning_budget=REASONING_BUDGET,
-            chat_template_kwargs={"enable_thinking": bool(enable_thinking)},
+            max_completion_tokens=max_tokens,
+            model_kwargs={
+                "reasoning_budget": REASONING_BUDGET,
+                "chat_template_kwargs": {"enable_thinking": bool(enable_thinking)},
+            },
         )
 
     def chat(
@@ -399,7 +409,9 @@ class NvidiaLangChainProvider(AIProvider):
 
         if enable_thinking and reasoning_parts:
             return "💭 *Thinking:*\n" + "".join(reasoning_parts) + "\n\n" + "".join(content_parts)
-        return "".join(content_parts)
+
+        # Strip any <think>...</think> blocks the model may emit even when thinking is off.
+        return _strip_think_tags("".join(content_parts))
 
 
 class ExaSearchService:
@@ -494,7 +506,19 @@ class ExaSearchService:
 provider = NvidiaLangChainProvider(NVIDIA_API_KEY or "")
 search_service = ExaSearchService(EXA_API_KEYS)
 user_sessions: Dict[str, Dict] = {}
-_llm_semaphore = asyncio.Semaphore(LLM_MAX_CONCURRENCY)
+_llm_semaphore: Optional[asyncio.Semaphore] = None
+
+
+def _get_semaphore() -> asyncio.Semaphore:
+    """Lazily create the LLM semaphore inside the running event loop.
+
+    Creating asyncio.Semaphore at module level before a loop exists is
+    deprecated in Python 3.10+ and raises a DeprecationWarning in 3.12+.
+    """
+    global _llm_semaphore
+    if _llm_semaphore is None:
+        _llm_semaphore = asyncio.Semaphore(LLM_MAX_CONCURRENCY)
+    return _llm_semaphore
 
 
 def _prune_user_sessions(now: float):
@@ -573,7 +597,7 @@ async def _chat_with_retry(
         if cancel_event and cancel_event.is_set():
             raise asyncio.CancelledError("Cancelled by /restart")
         try:
-            async with _llm_semaphore:
+            async with _get_semaphore():
                 result = await asyncio.wait_for(
                     asyncio.to_thread(
                         provider_obj.chat,
@@ -656,6 +680,8 @@ async def _research_answer_loop(
                 "content": user_message + "\n\n" + synth_context + prompt_suffix,
             }
         )
+        # Remove any stale system message before inserting the search-enriched one.
+        synth_msgs = [m for m in synth_msgs if m.get("role") != "system"]
         synth_msgs.insert(0, {"role": "system", "content": SYSTEM_PROMPT_WITH_RESULTS})
         return await _chat_with_retry(
             provider_obj=provider_obj,
@@ -730,28 +756,55 @@ async def _research_answer_loop(
     )
 
 
+async def _keep_typing(chat) -> None:
+    """Re-send the 'typing' action every 4 s so the indicator stays alive during long requests."""
+    try:
+        while True:
+            await chat.send_action(action="typing")
+            await asyncio.sleep(4)
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        pass
+
+
+def _clean_for_history(response: str) -> str:
+    """Strip the thinking-trace header before storing a response in conversation history.
+
+    The full formatted response (with the 💭 header) is sent to Telegram, but the
+    clean answer is what gets stored so subsequent turns don't have formatting noise
+    in the context window.
+    """
+    if response.startswith("\U0001f4ad *Thinking:*\n"):
+        sep = response.find("\n\n", len("\U0001f4ad *Thinking:*\n"))
+        if sep != -1:
+            return response[sep + 2:].strip()
+    return response
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     if not is_user_allowed(user_id):
-        await update.message.reply_text("⛔ Sorry, you're not authorized to use this bot.")
+        await update.message.reply_text("\u26d4 Sorry, you're not authorized to use this bot.")
         return
 
     session = get_user_session(user_id)
-    web_status = "ON" if session.get("web_search") else "OFF"
+    web_status = "ON \u2705" if session.get("web_search", True) else "OFF \U0001f515"
+    think_status = "ON \u2705" if session.get("thinking_enabled", True) else "OFF \U0001f515"
+    history_len = len([m for m in session.get("history", []) if m.get("role") != "system"])
     await update.message.reply_text(
-        "🤖 Hello! I am your NVIDIA + Exa assistant.\n\n"
-        f"🧠 Model: *{MODEL_ID}*\n"
-        "🔎 Search backend: *Exa.ai*\n"
-        f"🌐 Web Search: {web_status} (default ON)\n\n"
+        "\U0001f916 *NVIDIA + Exa Assistant*\n\n"
+        f"\U0001f9e0 Model: `{MODEL_ID}`\n"
+        f"\U0001f50e Web Search: {web_status}\n"
+        f"\U0001f4ad Thinking: {think_status}\n"
+        f"\U0001f4dc History: {history_len} messages\n\n"
         "*Commands:*\n"
-        "/web - show web status\n"
-        "/web on - enable web search\n"
-        "/web off - disable web search\n"
-        "/thinking on - include reasoning traces\n"
-        "/thinking off - hide reasoning traces\n"
-        "/clear - clear conversation history\n"
-        "/restart - cancel stuck request\n"
-        "/help - show help",
+        "`/status` \u2014 show current settings\n"
+        "`/web on|off` \u2014 toggle web search\n"
+        "`/thinking on|off` \u2014 toggle reasoning traces\n"
+        "`/clear` \u2014 clear conversation history\n"
+        "`/restart` \u2014 cancel a stuck request\n"
+        "`/help` \u2014 full help",
         parse_mode="Markdown",
     )
 
@@ -853,8 +906,31 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         history.pop()
 
     await update.message.reply_text(
-        "🛑 *Restart requested.*\n\n"
+        "\U0001f6d1 *Restart requested.*\n\n"
         "Any pending AI request has been signalled to stop. You can send a new message now.",
+        parse_mode="Markdown",
+    )
+    # Clear the event so the next incoming message is not immediately cancelled.
+    cancel_event.clear()
+
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    if not is_user_allowed(user_id):
+        await update.message.reply_text("\u26d4 Sorry, you're not authorized to use this bot.")
+        return
+
+    session = get_user_session(user_id)
+    web = "ON \u2705" if session.get("web_search", True) else "OFF \U0001f515"
+    thinking = "ON \u2705" if session.get("thinking_enabled", True) else "OFF \U0001f515"
+    history_len = len([m for m in session.get("history", []) if m.get("role") != "system"])
+    await update.message.reply_text(
+        "\U0001f4ca *Current Settings*\n\n"
+        f"\U0001f9e0 *Model:* `{MODEL_ID}`\n"
+        f"\U0001f4ad *Thinking:* {thinking}\n"
+        f"\U0001f310 *Web Search:* {web}\n"
+        f"\U0001f4dc *History:* {history_len} messages\n"
+        f"\U0001f511 *Exa keys:* {len(EXA_API_KEYS)}",
         parse_mode="Markdown",
     )
 
@@ -879,15 +955,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cancel_event: asyncio.Event = session["cancel_event"]
     cancel_event.clear()
     assistant_appended = False
+    typing_task: Optional[asyncio.Task] = None
 
     try:
         if cancel_event.is_set():
             return
 
-        try:
-            await update.message.chat.send_action(action="typing")
-        except Exception:
-            pass
+        # Keep the "typing…" indicator alive for the full duration of the request.
+        typing_task = asyncio.create_task(_keep_typing(update.message.chat))
 
         thinking_enabled = session.get("thinking_enabled", True)
         web_on = session.get("web_search", True)
@@ -906,6 +981,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             logger.info("[Bot] user=%s iterative research loop enabled", user_id)
+            try:
+                await update.message.reply_text("\U0001f50d Searching the web\u2026")
+            except Exception:
+                pass
             bot_response = await _research_answer_loop(
                 provider_obj=provider,
                 session_history=session["history"],
@@ -915,9 +994,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
         if not bot_response.strip():
-            bot_response = "⚠️ The AI returned an empty response. Please try again."
+            bot_response = "\u26a0\ufe0f The AI returned an empty response. Please try again."
 
-        session["history"].append({"role": "assistant", "content": bot_response})
+        # Store a clean response (no thinking-trace header) to keep context window tidy.
+        session["history"].append({"role": "assistant", "content": _clean_for_history(bot_response)})
         assistant_appended = True
         _trim_history(session["history"])
 
@@ -926,14 +1006,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             header_reserve = 25
             chunk_limit = MAX_MESSAGE_LENGTH - header_reserve
-            chunks, current_chunk = [], ""
+            chunks: List[str] = []
+            current_chunk = ""
             for line in bot_response.split("\n"):
                 if len(line) > chunk_limit:
                     if current_chunk:
                         chunks.append(current_chunk)
                         current_chunk = ""
-                    for j in range(0, len(line), chunk_limit):
-                        chunks.append(line[j : j + chunk_limit])
+                    # Split long lines at word boundaries to avoid breaking mid-word.
+                    remaining = line
+                    while remaining:
+                        if len(remaining) <= chunk_limit:
+                            chunks.append(remaining)
+                            break
+                        split_at = remaining.rfind(" ", 0, chunk_limit)
+                        if split_at <= 0:
+                            split_at = chunk_limit
+                        chunks.append(remaining[:split_at])
+                        remaining = remaining[split_at:].lstrip()
                     continue
                 if len(current_chunk) + len(line) + 1 > chunk_limit:
                     if current_chunk:
@@ -945,7 +1035,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chunks.append(current_chunk)
 
             for i, chunk in enumerate(chunks, 1):
-                header = f"📄 Part {i}/{len(chunks)}\n\n" if len(chunks) > 1 else ""
+                header = f"\U0001f4c4 Part {i}/{len(chunks)}\n\n" if len(chunks) > 1 else ""
                 await reply_text_safe(update.message, header + chunk)
 
     except asyncio.CancelledError:
@@ -970,11 +1060,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             session["history"].pop()
         try:
             await update.message.reply_text(
-                f"❌ Error: {str(e)}\n\n"
-                "Try:\n• `/clear` to reset conversation\n• `/restart` to cancel stuck calls"
+                "\u274c Something went wrong processing your request.\n\n"
+                "Try:\n\u2022 `/clear` to reset conversation\n\u2022 `/restart` to cancel stuck calls",
+                parse_mode="Markdown",
             )
         except Exception:
             pass
+    finally:
+        if typing_task and not typing_task.done():
+            typing_task.cancel()
 
 
 def main():
@@ -992,6 +1086,7 @@ def main():
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("clear", clear))
     application.add_handler(CommandHandler("web", web_command))
     application.add_handler(CommandHandler("thinking", thinking_command))
