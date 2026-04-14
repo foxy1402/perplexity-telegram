@@ -46,8 +46,8 @@ Required:
 
 Optional:
 
-- `TELEGRAM_ALLOWED_UIDS` - Comma-separated Telegram user IDs allowed to chat
-- `ALLOWED_USER_IDS` - Backward-compatible alias for allowlist
+- `TELEGRAM_ALLOWED_UIDS` - Preferred allowlist var. Comma-separated Telegram numeric user IDs allowed to chat
+- `ALLOWED_USER_IDS` - Legacy fallback alias. Only used when `TELEGRAM_ALLOWED_UIDS` is empty
 - `MAX_TOKENS` - Default: `4096`
 - `REASONING_BUDGET` - Default: `16384`
 - `TEMPERATURE` - Default: `0.7`
@@ -114,10 +114,17 @@ python bot.py
 1. For trivial greetings/short messages, bot answers directly.
 2. For normal messages, bot enters an iterative planner loop.
 3. At each step, the model decides one action:
-  - `SEARCH: query` (continue research)
-  - `FINAL: answer` (stop and answer)
+   - `SEARCH: query` (continue research)
+   - `FINAL: answer` (stop and answer)
 4. The loop can repeat up to `RESEARCH_MAX_STEPS`.
 5. Exa results are accumulated and used for final synthesis when needed.
+
+## UID Allowlist Notes
+
+- Use `TELEGRAM_ALLOWED_UIDS` in new deployments.
+- IDs must be Telegram numeric user IDs, not usernames.
+- If `TELEGRAM_ALLOWED_UIDS` is not set or empty, the bot falls back to `ALLOWED_USER_IDS`.
+- If both are empty, the bot is open to all users.
 
 ## Exa Key Rotation
 
