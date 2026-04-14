@@ -354,6 +354,11 @@ def _get_recent_context(session_history: list, max_pairs: int = 2) -> str:
 
 
 def _parse_research_action(response: str) -> Tuple[str, Optional[str]]:
+    """Parse planner response to extract action (search/final/unknown) and payload.
+
+    Handles both strict format (SEARCH:/FINAL:) and common abbreviations (FIN:) that
+    may occur when the model is token-limited. Returns (action_type, payload) tuple.
+    """
     stripped = (response or "").strip()
     if not stripped:
         return ("unknown", None)
@@ -366,13 +371,19 @@ def _parse_research_action(response: str) -> Tuple[str, Optional[str]]:
         ans = stripped[6:].strip()
         return ("final", ans if ans else None)
 
+    # Handle common abbreviations like "FIN:" instead of "FINAL:"
+    if stripped.upper().startswith("FIN:"):
+        ans = stripped[4:].strip()
+        return ("final", ans if ans else None)
+
     m_search = re.search(r"(?i)\bSEARCH:\s*(.+)", stripped)
     if m_search:
         q = _parse_search_query("SEARCH: " + m_search.group(1))
         if q:
             return ("search", q)
 
-    m_final = re.search(r"(?is)\bFINAL:\s*(.+)", stripped)
+    # Try to find FINAL: or FIN: anywhere in the response
+    m_final = re.search(r"(?is)\b(?:FINAL|FIN):\s*(.+)", stripped)
     if m_final:
         ans = m_final.group(1).strip()
         if ans:
@@ -796,7 +807,7 @@ async def _research_answer_loop(
             provider_obj=provider_obj,
             messages=planner_messages,
             enable_thinking=False,
-            max_tokens=300,  # Reduced from 500 to prevent truncation
+            max_tokens=400,  # Balanced to prevent both truncation and excessive verbosity
             cancel_event=cancel_event,
         )
         action, payload = _parse_research_action(decision)
