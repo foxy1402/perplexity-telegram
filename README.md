@@ -1,26 +1,37 @@
 # NVIDIA + Exa Telegram Assistant
 
-A Perplexity-style Telegram bot built with:
-- LangChain + NVIDIA NIM chat model
-- Exa search retrieval with multi-key rotation
-- Iterative search loop (multiple SEARCH rounds before FINAL answer)
+A grounded-answer Telegram bot built with:
+- LangChain + NVIDIA NIM chat model with native tool calling
+- Exa `/answer` endpoint (web-grounded answers) with multi-key rotation
+- Single-tool agent: the LLM decides whether to answer directly or query the web
 - Environment-variable-only configuration (container friendly)
 
 ## Model and Search Stack
 
 - Chat model: `nvidia/nemotron-3-super-120b-a12b`
 - Chat provider SDK: `langchain-nvidia-ai-endpoints`
-- Search provider: Exa via `langchain-exa`
+- Web answers: Exa `/answer` via `exa-py`
 - Exa keys: CSV from `EXA_API_KEYS` (example: `key1,key2,key3`)
+
+## Architecture
+
+Each user message goes through up to two LLM calls and (optionally) one Exa call:
+
+1. **Orchestrator** — NVIDIA LLM sees the full chat history with a `web_answer(query)` tool bound. It either:
+   - Answers the user directly from training data + context (no tool call), or
+   - Emits a tool call with a fully self-contained query (pronouns resolved, current year stamped).
+2. **Exa `/answer`** — fetches a fresh, web-grounded answer for the rewritten query. Multi-key rotation handles rate limits.
+3. **Formatter** — NVIDIA LLM rewrites the grounded answer in Telegram-safe markdown, stripping citation markers `[1]`, `[2]`, etc.
+
+The orchestrator handles multi-turn context: Exa is stateless, so the LLM is instructed to rewrite each follow-up question into a self-contained query that re-injects prior entities.
 
 ## Features
 
-- Single-provider architecture (NVIDIA only)
-- Accuracy-first loop: model can search multiple times before answering
-- Web search enabled by default
-- Exa API key rotation to maximize free-tier usage
+- Single-tool agent loop (no hand-rolled planner protocol or regex parsing)
+- Multi-turn aware: pronouns/entities resolved by the orchestrator before search
+- Multi-key Exa rotation to maximize free-tier usage
 - Retry and cancellation support (`/restart`)
-- Telegram markdown-safe responses
+- Telegram markdown-safe responses (no `##`, no LaTeX, no `|` tables, no `[N]` citations)
 - Optional Telegram UID allowlist
 
 ## Requirements
@@ -53,11 +64,11 @@ Optional:
 - `TEMPERATURE` - Default: `0.7`
 - `TOP_P` - Default: `0.95`
 - `MAX_HISTORY_MESSAGES` - Default: `20`
-- `EXA_MAX_RESULTS` - Default: `5`
-- `EXA_MAX_SNIPPET_LEN` - Default: `500`
-- `EXA_TIMEOUT_SECONDS` - Default: `20`
-- `RESEARCH_MAX_STEPS` - Default: `4`
-- `RESEARCH_MAX_SNIPPETS` - Default: `20`
+- `EXA_TIMEOUT_SECONDS` - Default: `30` (per Exa /answer call)
+- `EXA_ANSWER_MODEL` - Optional Exa model override (e.g. `exa`, `exa-pro`). Default: Exa picks
+- `SESSION_TTL_SECONDS` - Default: `86400`
+- `MAX_USER_SESSIONS` - Default: `5000`
+- `LLM_MAX_CONCURRENCY` - Default: `8`
 
 ## Example Environment
 
@@ -70,11 +81,7 @@ MAX_TOKENS=4096
 REASONING_BUDGET=16384
 TEMPERATURE=0.7
 TOP_P=0.95
-EXA_MAX_RESULTS=5
-EXA_MAX_SNIPPET_LEN=500
-EXA_TIMEOUT_SECONDS=20
-RESEARCH_MAX_STEPS=4
-RESEARCH_MAX_SNIPPETS=20
+EXA_TIMEOUT_SECONDS=30
 ```
 
 ## Run Locally
@@ -100,25 +107,25 @@ python bot.py
 ## Commands
 
 - `/start` - Show bot info and current settings
-- `/status` - Show current model, thinking mode, web search state, history length, and Exa key count
+- `/status` - Show current model, thinking mode, web-access state, history length, and Exa key count
 - `/help` - Show usage help
-- `/web` - Show web-search state
-- `/web on` - Enable Exa search
-- `/web off` - Disable web search
+- `/web` - Show web-access state
+- `/web on` - Enable Exa `/answer` tool
+- `/web off` - Disable web access (model answers from training only)
 - `/thinking on` - Include reasoning traces in output
 - `/thinking off` - Hide reasoning traces
 - `/clear` - Clear conversation history
 - `/restart` - Cancel a stuck/pending request
 
-## How Search Works
+## How the Agent Works
 
-1. For trivial greetings/short messages, bot answers directly.
-2. For normal messages, bot enters an iterative planner loop.
-3. At each step, the model decides one action:
-   - `SEARCH: query` (continue research)
-   - `FINAL: answer` (stop and answer)
-4. The loop can repeat up to `RESEARCH_MAX_STEPS`.
-5. Exa results are accumulated and used for final synthesis when needed.
+1. User sends a message; bot appends it to the session history.
+2. If web access is OFF: NVIDIA answers directly using only its training data + conversation history.
+3. If web access is ON:
+   - NVIDIA is invoked with the `web_answer` tool bound.
+   - For greetings, self-capability questions, well-established facts, programming help, and follow-ups answerable from prior turns, NVIDIA returns a direct answer (no tool call).
+   - For current events, prices, latest versions, news, or anything requiring fresh data, NVIDIA emits a `web_answer(query="...")` call. The query is rewritten to be self-contained.
+   - The bot calls Exa `/answer`, then runs a second NVIDIA pass to format the grounded answer for Telegram.
 
 ## UID Allowlist Notes
 
@@ -131,7 +138,7 @@ python bot.py
 
 - Keys are loaded from `EXA_API_KEYS` in memory.
 - Requests use round-robin key selection.
-- On transient/rate-limit failure, bot tries the next key.
+- On transient/rate-limit failure, the bot tries the next key.
 - No persistent disk required.
 
 ## Container Notes
@@ -165,3 +172,5 @@ python bot.py
 - Bot replies with empty output
   - Try `/restart`, then resend.
   - Reduce temperature or adjust token limits.
+- Bot keeps calling the web for follow-ups that should be answerable from prior context
+  - That is the LLM's call. If you find it over-searching, you can edit the `WHEN TO ANSWER DIRECTLY` section in `_PROMPT_ORCHESTRATOR` to bias it more.
