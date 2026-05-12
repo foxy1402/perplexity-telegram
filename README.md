@@ -21,7 +21,7 @@ Each user message goes through up to two LLM calls and (optionally) one Exa call
    - Answers the user directly from training data + context (no tool call), or
    - Emits a tool call with a fully self-contained query (pronouns resolved, current year stamped).
 2. **Exa `/answer`** — fetches a fresh, web-grounded answer for the rewritten query. Multi-key rotation handles rate limits.
-3. **Formatter** — NVIDIA LLM rewrites the grounded answer in Telegram-safe markdown, stripping citation markers `[1]`, `[2]`, etc.
+3. **Formatter** — NVIDIA LLM rewrites the grounded answer in Telegram-safe markdown. All citation artifacts (inline `[Site](url)` links, numeric `[1]` markers, `Sources:` footers, bare URLs) are stripped before and after the formatter pass — the user sees a clean, attribution-free answer.
 
 The orchestrator handles multi-turn context: Exa is stateless, so the LLM is instructed to rewrite each follow-up question into a self-contained query that re-injects prior entities.
 
@@ -32,7 +32,7 @@ The orchestrator handles multi-turn context: Exa is stateless, so the LLM is ins
 - **Conversation memory** — older turns are summarized into a running memory note so long chats stay coherent past the context window
 - Multi-key Exa rotation to maximize free-tier usage
 - Retry and cancellation support (`/restart`)
-- Telegram markdown-safe responses (no `##`, no LaTeX, no `|` tables, no `[N]` citations)
+- Telegram markdown-safe responses (no `##`, no LaTeX, no `|` tables, **no citations or source links** — clean answer only)
 - Optional Telegram UID allowlist
 
 ## Requirements

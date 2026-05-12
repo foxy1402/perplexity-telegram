@@ -164,15 +164,16 @@ MODEL_ID = "nvidia/nemotron-3-super-120b-a12b"
 
 _TELEGRAM_FORMAT_RULES = (
     "TELEGRAM FORMATTING RULES (strict):\n"
-    "- Plain Telegram Markdown only: *bold*, _italic_, `code`, ```code blocks```, "
-    "and [text](https://url) inline links (these render as clickable hyperlinks)\n"
+    "- Plain Telegram Markdown only: *bold*, _italic_, `code`, ```code blocks```\n"
     "- Never use ## headers - they do not render in Telegram\n"
     "- Never use LaTeX math notation\n"
     "- Use flat bullet lists (- item). Never nest lists\n"
     "- Never use | pipe | tables - they do not render in Telegram\n"
     "- For comparisons: use *bold item name* on its own line, then bullet points for attributes\n"
     "- Keep responses concise. Avoid long preambles and sign-offs\n"
-    "- When code is requested, use fenced code blocks with the language name"
+    "- When code is requested, use fenced code blocks with the language name\n"
+    "- Do NOT include source links, citation markers, URLs, or 'sources:' sections in your response. "
+    "Output a clean answer with no attribution."
 )
 
 SYSTEM_PROMPT = (
@@ -230,11 +231,11 @@ _PROMPT_FORMATTER = (
     "- Rewrite the web research as a clear, direct answer to the user's question.\n"
     "- Preserve ALL factual content from the research. Do NOT invent facts that are not in it.\n"
     "- If the research is missing information needed to answer, say so honestly.\n"
-    "- Do NOT mention 'the search results' or 'the web answer' explicitly - speak naturally.\n"
-    "- The research often contains inline source links in the form [Site Name](https://url). "
-    "PRESERVE these links exactly - keep them where they appear. They render as clickable "
-    "hyperlinks in Telegram and serve as sources for the user. Do NOT strip or rewrite them.\n"
-    "- DO strip any numeric citation markers like [1], [2], (1, 2), etc. if they ever appear.\n"
+    "- Do NOT mention 'the search results', 'the web answer', or where the information came from. "
+    "Speak naturally as if you simply know the answer.\n"
+    "- ABSOLUTELY NO source attribution: no inline links, no URLs, no site names as citations, "
+    "no numeric markers like [1] or (1, 2), no 'Sources:' or 'References:' section. "
+    "The user wants a clean answer only.\n"
     "- If the research says it failed or returned nothing, apologize briefly and offer to retry.\n\n"
     + _TELEGRAM_FORMAT_RULES
 )
@@ -292,24 +293,55 @@ def _strip_think_tags(text: str) -> str:
     return re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.IGNORECASE).strip()
 
 
-# Match only NUMERIC citation markers: [1], [2], [1, 2]. The negative lookahead
-# `(?!\()` ensures we never touch `[Title](url)` markdown links - Exa embeds
-# clickable sources in that form and we want Telegram to render them.
-_CITATION_MARKER_RE = re.compile(r"\s*\[\d+(?:\s*,\s*\d+)*\](?!\()")
+# Inline markdown source link of the form `[Site Name](https://url)`. Exa
+# embeds clickable sources in this form; we strip them entirely for a clean
+# citation-free answer. URL char class disallows whitespace and `)` so the
+# match is greedy enough for typical citation URLs.
+_INLINE_CITATION_LINK_RE = re.compile(r"\[[^\]]+\]\(https?://[^)\s]+\)")
+# After removing the links above, citations often leave behind an empty
+# parenthetical cluster like " (; ; ;)" or " ()". This regex removes such
+# leftovers; it only matches parens whose interior contains nothing but
+# whitespace, semicolons, and commas - so real prose parens are safe.
+_EMPTY_PAREN_CLUSTER_RE = re.compile(r"\s*\(\s*[\s;,]*\)")
+# Numeric citation markers: [1], [2], [1, 2]. Negative lookahead avoids
+# accidentally matching `[Title]` from any markdown link still present.
+_NUMERIC_CITATION_RE = re.compile(r"\s*\[\d+(?:\s*,\s*\d+)*\](?!\()")
+# Bare URLs left over (e.g. if a link did not have anchor text).
+_BARE_URL_RE = re.compile(r"\s*https?://\S+")
+# Trailing "Sources:" / "References:" / "Citations:" footer up to end of text.
+_SOURCES_FOOTER_RE = re.compile(
+    r"\n+\s*\**\s*(?:sources?|references?|citations?)\s*\**\s*[:\-].*\Z",
+    re.IGNORECASE | re.DOTALL,
+)
+# Collapse runs of horizontal whitespace and fix orphaned punctuation
+# (e.g. ` .` -> `.`) that can appear where citations used to sit.
+_MULTI_SPACE_RE = re.compile(r"[ \t]{2,}")
+_ORPHAN_PUNCT_RE = re.compile(r" +([,.;:!?])")
 
 
 def _strip_citation_markers(text: str) -> str:
-    """Remove numeric citation markers like [1], [2], [1, 2] from Exa answers.
+    """Strip ALL citation artifacts from a raw Exa answer.
 
-    Preserves markdown source links of the form `[Title](url)` so Telegram can
-    render them as clickable hyperlinks.
+    Removes inline markdown source links (`[Site](url)`), empty parenthetical
+    clusters left behind after link removal, numeric markers (`[1]`, `[1, 2]`),
+    bare URLs, and any trailing `Sources:` / `References:` footer. The result
+    is a clean, attribution-free answer ready for the formatter LLM.
     """
-    return _CITATION_MARKER_RE.sub("", text or "").strip()
+    if not text:
+        return ""
+    out = _INLINE_CITATION_LINK_RE.sub("", text)
+    out = _EMPTY_PAREN_CLUSTER_RE.sub("", out)
+    out = _NUMERIC_CITATION_RE.sub("", out)
+    out = _SOURCES_FOOTER_RE.sub("", out)
+    out = _BARE_URL_RE.sub("", out)
+    out = _MULTI_SPACE_RE.sub(" ", out)
+    out = _ORPHAN_PUNCT_RE.sub(r"\1", out)
+    return out.strip()
 
 
 @tool
 def web_answer(query: str) -> str:
-    """Search the web and return a fresh, grounded answer with citations.
+    """Search the web and return a fresh, grounded answer.
 
     Use this for current events, recent releases, time-sensitive data (prices, weather,
     sports scores, stocks), latest versions, news, or any factual question where you need
