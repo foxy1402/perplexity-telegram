@@ -117,11 +117,42 @@ try:
 except ValueError:
     LLM_MAX_CONCURRENCY = 8
 
+COMPACT_ENABLED = os.getenv("COMPACT_ENABLED", "true").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+
+try:
+    COMPACT_THRESHOLD_MESSAGES = int(os.getenv("COMPACT_THRESHOLD_MESSAGES", "16"))
+except ValueError:
+    COMPACT_THRESHOLD_MESSAGES = 16
+
+try:
+    COMPACT_KEEP_RECENT_MESSAGES = int(os.getenv("COMPACT_KEEP_RECENT_MESSAGES", "8"))
+except ValueError:
+    COMPACT_KEEP_RECENT_MESSAGES = 8
+
+try:
+    MEMORY_MAX_CHARS = int(os.getenv("MEMORY_MAX_CHARS", "2000"))
+except ValueError:
+    MEMORY_MAX_CHARS = 2000
+
 # Safety bounds for production misconfiguration.
 SESSION_TTL_SECONDS = max(300, SESSION_TTL_SECONDS)
 MAX_USER_SESSIONS = max(100, MAX_USER_SESSIONS)
 LLM_MAX_CONCURRENCY = max(1, min(LLM_MAX_CONCURRENCY, 64))
 EXA_TIMEOUT_SECONDS = max(5.0, min(EXA_TIMEOUT_SECONDS, 120.0))
+# Compaction threshold must be at least 4 messages and leave room to keep some recent
+# turns verbatim; keep-recent must leave at least one Q&A pair to compact.
+COMPACT_THRESHOLD_MESSAGES = max(
+    4, min(COMPACT_THRESHOLD_MESSAGES, MAX_HISTORY_MESSAGES)
+)
+COMPACT_KEEP_RECENT_MESSAGES = max(
+    2, min(COMPACT_KEEP_RECENT_MESSAGES, COMPACT_THRESHOLD_MESSAGES - 2)
+)
+MEMORY_MAX_CHARS = max(200, min(MEMORY_MAX_CHARS, 8000))
 
 MAX_MESSAGE_LENGTH = 4096
 MAX_INPUT_LENGTH = 4000
@@ -209,6 +240,25 @@ _PROMPT_FORMATTER = (
 )
 
 
+_PROMPT_SUMMARIZER = (
+    "You are a conversation summarizer for an AI Telegram assistant.\n\n"
+    "Goal: produce a concise running memory (at most {max_chars} characters) that captures "
+    "everything the assistant will need to handle follow-up questions once the earliest "
+    "turns of this chat fall out of the verbatim context window.\n\n"
+    "MUST PRESERVE:\n"
+    "- Topics and entities discussed (products, names, places, projects, files, code)\n"
+    "- User identity hints, stated preferences, constraints, goals\n"
+    "- Factual conclusions, decisions made, recommendations given\n"
+    "- Outstanding questions or open threads\n\n"
+    "FORMAT:\n"
+    "- Plain prose, optionally with short bullets\n"
+    "- Third person from the assistant's POV (e.g. 'The user asked about X; I explained Y.')\n"
+    "- No greetings, acknowledgments, or filler\n"
+    "- No Telegram markdown - this memory is internal, not user-facing\n\n"
+    "OUTPUT: ONLY the new combined summary, no preamble or commentary."
+)
+
+
 def _make_orchestrator_prompt() -> str:
     now = datetime.datetime.now()
     return _PROMPT_ORCHESTRATOR.format(
@@ -219,6 +269,22 @@ def _make_orchestrator_prompt() -> str:
 def _make_formatter_prompt() -> str:
     now = datetime.datetime.now()
     return _PROMPT_FORMATTER.format(date=now.strftime("%Y-%m-%d"))
+
+
+def _build_system_with_memory(base_prompt: str, memory: Optional[str]) -> str:
+    """Append a compact memory section to a base system prompt.
+
+    The memory is a summary of conversation turns that have fallen out of the
+    verbatim history window. It is treated as background knowledge of the
+    conversation, separate from the recent turn-by-turn messages.
+    """
+    if not memory or not memory.strip():
+        return base_prompt
+    return (
+        base_prompt
+        + "\n\n## Conversation memory (earlier turns, summarized)\n"
+        + memory.strip()
+    )
 
 
 def _strip_think_tags(text: str) -> str:
@@ -483,13 +549,21 @@ def get_user_session(user_id: str) -> Dict:
     if user_id not in user_sessions:
         user_sessions[user_id] = {
             "history": [],
+            "memory": "",
             "thinking_enabled": False,
             "web_search": True,
             "last_seen": now,
             "cancel_event": asyncio.Event(),
+            "compact_in_progress": False,
+            "_bg_tasks": set(),
         }
     else:
-        user_sessions[user_id]["last_seen"] = now
+        sess = user_sessions[user_id]
+        sess["last_seen"] = now
+        # Backfill defaults for sessions created before compaction shipped.
+        sess.setdefault("memory", "")
+        sess.setdefault("compact_in_progress", False)
+        sess.setdefault("_bg_tasks", set())
     return user_sessions[user_id]
 
 
@@ -698,6 +772,163 @@ async def _decide_with_retry(
     )
 
 
+async def _summarize_history(
+    provider_obj,
+    existing_memory: str,
+    old_messages: List[Dict],
+) -> str:
+    """Fold a chunk of old messages into a single running-memory summary.
+
+    Returns the new combined summary (truncated to MEMORY_MAX_CHARS). On any
+    failure, returns the existing memory unchanged so the caller can decide
+    whether to mutate session state.
+    """
+    if not old_messages:
+        return existing_memory or ""
+
+    lines: List[str] = []
+    for m in old_messages:
+        role = (m.get("role") or "?").upper()
+        content = (m.get("content") or "").strip()
+        if not content:
+            continue
+        # Truncate very long single messages so the summarizer prompt stays bounded.
+        if len(content) > 1200:
+            content = content[:1200] + "...(truncated)"
+        lines.append(f"{role}: {content}")
+
+    sections: List[str] = []
+    if existing_memory and existing_memory.strip():
+        sections.append("EXISTING SUMMARY:\n" + existing_memory.strip())
+    if lines:
+        sections.append("NEW MESSAGES TO INCORPORATE:\n" + "\n\n".join(lines))
+    if not sections:
+        return existing_memory or ""
+
+    summarize_messages = [
+        {
+            "role": "system",
+            "content": _PROMPT_SUMMARIZER.format(max_chars=MEMORY_MAX_CHARS),
+        },
+        {"role": "user", "content": "\n\n".join(sections)},
+    ]
+
+    try:
+        summary = await _chat_with_retry(
+            provider_obj=provider_obj,
+            messages=summarize_messages,
+            enable_thinking=False,
+            show_thinking=False,
+            max_tokens=max(512, MEMORY_MAX_CHARS // 2),
+        )
+    except Exception as e:
+        logger.warning("[Compact] summarize call failed: %s", e)
+        return existing_memory or ""
+
+    summary = (summary or "").strip()
+    if not summary:
+        return existing_memory or ""
+    if len(summary) > MEMORY_MAX_CHARS:
+        # Trim on a sentence boundary when possible to avoid cutting mid-word.
+        head = summary[:MEMORY_MAX_CHARS]
+        cut = head.rfind(". ")
+        summary = (head[: cut + 1] if cut > MEMORY_MAX_CHARS // 2 else head).strip()
+    return summary
+
+
+async def _maybe_compact_session(provider_obj, session: Dict) -> None:
+    """Background task: fold old turns into `session['memory']` when history exceeds threshold.
+
+    Safe to call frequently - returns immediately if compaction is disabled,
+    already in progress, or not yet needed. On completion, atomically removes
+    only the prefix that was actually summarized, so concurrent appends or
+    `/clear` operations during summarization do not corrupt history.
+    """
+    if not COMPACT_ENABLED:
+        return
+    if session.get("compact_in_progress"):
+        return
+
+    history = session.get("history")
+    if not isinstance(history, list):
+        return
+
+    convo_count = sum(
+        1 for m in history if m.get("role") in ("user", "assistant")
+    )
+    if convo_count <= COMPACT_THRESHOLD_MESSAGES:
+        return
+
+    keep = COMPACT_KEEP_RECENT_MESSAGES
+    if len(history) <= keep:
+        return
+
+    session["compact_in_progress"] = True
+    try:
+        # Snapshot the prefix we intend to summarize. After the await below
+        # the history may have grown (new turns) or been reset (/clear).
+        old_messages = list(history[:-keep])
+        if not old_messages:
+            return
+        existing_memory = session.get("memory") or ""
+
+        logger.info(
+            "[Compact] start: history=%s memory_chars=%s prefix_to_summarize=%s",
+            len(history),
+            len(existing_memory),
+            len(old_messages),
+        )
+
+        new_summary = await _summarize_history(
+            provider_obj=provider_obj,
+            existing_memory=existing_memory,
+            old_messages=old_messages,
+        )
+        if not new_summary or not new_summary.strip():
+            logger.warning("[Compact] empty summary; skipping mutation")
+            return
+
+        # Atomic safety check before mutating: the list reference must still be
+        # the same object AND its first message must match what we summarized.
+        # If `/clear` ran during summarization, the reference changes; if the
+        # prefix changed for some other reason, we abort to stay consistent.
+        current = session.get("history")
+        if (
+            current is not history
+            or len(current) < len(old_messages)
+            or current[0] != old_messages[0]
+        ):
+            logger.info("[Compact] aborted: history mutated during summarize")
+            return
+
+        del history[: len(old_messages)]
+        session["memory"] = new_summary
+        logger.info(
+            "[Compact] done: removed=%s remaining_history=%s memory_chars=%s",
+            len(old_messages),
+            len(history),
+            len(new_summary),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.warning("[Compact] failed: %s", e)
+    finally:
+        session["compact_in_progress"] = False
+
+
+def _spawn_background(coro, bag: set) -> asyncio.Task:
+    """Fire-and-forget an awaitable, keeping a strong reference until it completes.
+
+    asyncio only holds weak references to tasks, so without this helper a
+    background task can be garbage-collected mid-flight.
+    """
+    task = asyncio.create_task(coro)
+    bag.add(task)
+    task.add_done_callback(bag.discard)
+    return task
+
+
 async def _exa_answer(
     query: str, cancel_event: Optional["asyncio.Event"] = None
 ) -> Optional[str]:
@@ -783,11 +1014,13 @@ async def _agent_answer_loop(
     thinking_enabled: bool,
     cancel_event: Optional["asyncio.Event"] = None,
     on_tool_call: Optional[Callable[[], Awaitable[Any]]] = None,
+    session_memory: Optional[str] = None,
 ) -> str:
     """Single-turn tool-calling agent loop.
 
     FLOW:
-      1. Orchestrator: NVIDIA LLM (with `web_answer` bound) sees full history and either:
+      1. Orchestrator: NVIDIA LLM (with `web_answer` bound) sees full history plus
+         the running `session_memory` (summary of older turns) and either:
            (a) answers the user directly -> return that content, OR
            (b) emits a tool_call with a self-contained rewritten query.
       2. If tool_call: run Exa /answer, then call a formatter LLM pass that rewrites
@@ -795,8 +1028,11 @@ async def _agent_answer_loop(
          as the natural anchor.
       3. If Exa fails: tell the formatter so it can apologize cleanly.
     """
+    orchestrator_system = _build_system_with_memory(
+        _make_orchestrator_prompt(), session_memory
+    )
     orchestrator_messages = (
-        [{"role": "system", "content": _make_orchestrator_prompt()}]
+        [{"role": "system", "content": orchestrator_system}]
         + list(session_history)
     )
 
@@ -816,9 +1052,11 @@ async def _agent_answer_loop(
             return direct_content
         # Empty content AND no tool calls -> fall back to a normal chat call.
         logger.warning("[Agent] orchestrator returned empty; falling back to chat")
+        fallback_system = _build_system_with_memory(SYSTEM_PROMPT, session_memory)
         return await _chat_with_retry(
             provider_obj=provider_obj,
-            messages=session_history,
+            messages=[{"role": "system", "content": fallback_system}]
+            + list(session_history),
             enable_thinking=True,
             show_thinking=thinking_enabled,
             cancel_event=cancel_event,
@@ -869,9 +1107,11 @@ async def _agent_answer_loop(
             }
         )
 
+    formatter_system = _build_system_with_memory(
+        _make_formatter_prompt(), session_memory
+    )
     formatter_messages = (
-        [{"role": "system", "content": _make_formatter_prompt()}]
-        + formatter_history
+        [{"role": "system", "content": formatter_system}] + formatter_history
     )
 
     return await _chat_with_retry(
@@ -949,8 +1189,12 @@ async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "⛔ Sorry, you're not authorized to use this bot."
         )
         return
-    get_user_session(user_id)["history"] = []
-    await update.message.reply_text("🗑️ Conversation history cleared!")
+    session = get_user_session(user_id)
+    session["history"] = []
+    session["memory"] = ""
+    await update.message.reply_text(
+        "🗑️ Conversation history and memory cleared!"
+    )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1082,6 +1326,13 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [m for m in session.get("history", []) if m.get("role") != "system"]
     )
     exa_model_label = EXA_ANSWER_MODEL or "default"
+    memory_chars = len((session.get("memory") or "").strip())
+    if not COMPACT_ENABLED:
+        memory_status = "disabled"
+    elif memory_chars:
+        memory_status = f"{memory_chars} chars"
+    else:
+        memory_status = "empty"
     await update.message.reply_text(
         "\U0001f4ca *Current Settings*\n\n"
         f"\U0001f9e0 *Model:* `{MODEL_ID}`\n"
@@ -1089,6 +1340,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"\U0001f310 *Web Access:* {web}\n"
         f"\U0001f50e *Exa model:* `{exa_model_label}`\n"
         f"\U0001f4dc *History:* {history_len} messages\n"
+        f"\U0001f9e9 *Memory:* {memory_status}\n"
         f"\U0001f511 *Exa keys:* {len(EXA_API_KEYS)}",
         parse_mode="Markdown",
     )
@@ -1128,14 +1380,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         thinking_enabled = session.get("thinking_enabled", False)
         web_on = session.get("web_search", True)
+        session_memory = session.get("memory", "")
 
         session["history"].append({"role": "user", "content": user_message})
 
         if not web_on:
             logger.info("[Bot] user=%s direct path (web off)", user_id)
+            direct_messages = [
+                {
+                    "role": "system",
+                    "content": _build_system_with_memory(
+                        SYSTEM_PROMPT, session_memory
+                    ),
+                }
+            ] + list(session["history"])
             bot_response = await _chat_with_retry(
                 provider_obj=provider,
-                messages=session["history"],
+                messages=direct_messages,
                 enable_thinking=True,
                 show_thinking=thinking_enabled,
                 cancel_event=cancel_event,
@@ -1158,6 +1419,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 thinking_enabled=thinking_enabled,
                 cancel_event=cancel_event,
                 on_tool_call=_notify_searching,
+                session_memory=session_memory,
             )
 
         if not bot_response.strip():
@@ -1174,6 +1436,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _deliver_response(
             update.message, placeholder_holder.get("msg"), bot_response
         )
+
+        # Fire-and-forget background compaction. Returns immediately if the
+        # threshold has not been crossed, compaction is already running, or
+        # the feature is disabled via env var.
+        if COMPACT_ENABLED:
+            _spawn_background(
+                _maybe_compact_session(provider, session),
+                session["_bg_tasks"],
+            )
 
     except asyncio.CancelledError:
         logger.info("[Bot] user=%s request cancelled", user_id)

@@ -29,6 +29,7 @@ The orchestrator handles multi-turn context: Exa is stateless, so the LLM is ins
 
 - Single-tool agent loop (no hand-rolled planner protocol or regex parsing)
 - Multi-turn aware: pronouns/entities resolved by the orchestrator before search
+- **Conversation memory** — older turns are summarized into a running memory note so long chats stay coherent past the context window
 - Multi-key Exa rotation to maximize free-tier usage
 - Retry and cancellation support (`/restart`)
 - Telegram markdown-safe responses (no `##`, no LaTeX, no `|` tables, no `[N]` citations)
@@ -63,12 +64,16 @@ Optional:
 - `REASONING_BUDGET` - Default: `16384`
 - `TEMPERATURE` - Default: `0.7`
 - `TOP_P` - Default: `0.95`
-- `MAX_HISTORY_MESSAGES` - Default: `20`
+- `MAX_HISTORY_MESSAGES` - Default: `20` (hard cap; safety net if compaction fails)
 - `EXA_TIMEOUT_SECONDS` - Default: `30` (per Exa /answer call)
 - `EXA_ANSWER_MODEL` - Optional Exa model override (e.g. `exa`, `exa-pro`). Default: Exa picks
 - `SESSION_TTL_SECONDS` - Default: `86400`
 - `MAX_USER_SESSIONS` - Default: `5000`
 - `LLM_MAX_CONCURRENCY` - Default: `8`
+- `COMPACT_ENABLED` - Default: `true`. Set to `false` to disable conversation compaction
+- `COMPACT_THRESHOLD_MESSAGES` - Default: `16`. Once conversation exceeds this many messages, the oldest turns get folded into a summary in the background
+- `COMPACT_KEEP_RECENT_MESSAGES` - Default: `8`. After compaction this many recent messages stay verbatim; everything older is reduced to a summary
+- `MEMORY_MAX_CHARS` - Default: `2000`. Hard cap on the running memory string length
 
 ## Example Environment
 
@@ -107,25 +112,39 @@ python bot.py
 ## Commands
 
 - `/start` - Show bot info and current settings
-- `/status` - Show current model, thinking mode, web-access state, history length, and Exa key count
+- `/status` - Show current model, thinking mode, web-access state, history length, memory size, and Exa key count
 - `/help` - Show usage help
 - `/web` - Show web-access state
 - `/web on` - Enable Exa `/answer` tool
 - `/web off` - Disable web access (model answers from training only)
 - `/thinking on` - Include reasoning traces in output
 - `/thinking off` - Hide reasoning traces
-- `/clear` - Clear conversation history
+- `/clear` - Clear conversation history and memory
 - `/restart` - Cancel a stuck/pending request
 
 ## How the Agent Works
 
 1. User sends a message; bot appends it to the session history.
-2. If web access is OFF: NVIDIA answers directly using only its training data + conversation history.
+2. If web access is OFF: NVIDIA answers directly using only its training data + conversation history + memory.
 3. If web access is ON:
-   - NVIDIA is invoked with the `web_answer` tool bound.
+   - NVIDIA is invoked with the `web_answer` tool bound. It sees the recent history verbatim plus the running memory (if any).
    - For greetings, self-capability questions, well-established facts, programming help, and follow-ups answerable from prior turns, NVIDIA returns a direct answer (no tool call).
    - For current events, prices, latest versions, news, or anything requiring fresh data, NVIDIA emits a `web_answer(query="...")` call. The query is rewritten to be self-contained.
    - The bot calls Exa `/answer`, then runs a second NVIDIA pass to format the grounded answer for Telegram.
+
+## Conversation Memory (Compaction)
+
+Long chats outgrow the LLM context window. Instead of silently dropping the oldest turns (the old behavior), the bot keeps a sliding-window summary:
+
+- The most recent `COMPACT_KEEP_RECENT_MESSAGES` messages stay verbatim in history.
+- Everything older is condensed into a `memory` string (max `MEMORY_MAX_CHARS`) by a summarizer LLM pass.
+- That memory is appended to the orchestrator/formatter system prompts as "Conversation memory (earlier turns, summarized)" so the model still knows what was discussed.
+
+Compaction runs **in the background after the bot delivers a response**, so the user never feels the extra latency. If the threshold has not been crossed (`COMPACT_THRESHOLD_MESSAGES`), the compaction call is a no-op. The mutation step has an atomic safety check that aborts cleanly if `/clear` or another message arrived during summarization.
+
+Inspect the current memory size with `/status`. Use `/clear` to wipe both the history and the memory.
+
+Disable the feature entirely with `COMPACT_ENABLED=false` — the bot reverts to plain hard-truncation behavior.
 
 ## UID Allowlist Notes
 
